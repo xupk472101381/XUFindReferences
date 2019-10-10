@@ -5,6 +5,10 @@
   "description": "Find References",
   "unity": "2019.1",
   "unityRelease": "0b5",
+  "repository": {
+     "type": "git",
+     "url": "git+https://github.com/xupk472101381/XUFindReferences.git"
+  },
   "dependencies": {
     
   },

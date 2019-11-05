@@ -1,4 +1,5 @@
-﻿using System.Collections.Generic;
+﻿using System.Collections;
+using System.Collections.Generic;
 using System.IO;
 using UnityEditor;
 using UnityEngine;
@@ -6,7 +7,7 @@ using UnityEngine;
 namespace XUFindRef
 {
     [InitializeOnLoad]
-    public class XUFindReferencesCache
+    public class XUFindReferencesCache : AssetPostprocessor
     {
         private static XUFindReferencesCache mInstance;
         public static XUFindReferencesCache GetInstance()
@@ -21,19 +22,63 @@ namespace XUFindRef
         private Dictionary<string, List<string>> referencesForward = new Dictionary<string, List<string>>();//引用的GUID
         private Dictionary<string, List<string>> referencesReverse = new Dictionary<string, List<string>>();//被引用的GUID
 
+        private List<string> mCreateAllFiles = null;
+        private int mCreateIndexForward = 0;
+        private int mCreateCompleteForward = 0;
+        private int mCreateIndexReverse = 0;
+        private int mCreateCompleteReverse = 0;
+
+        private float mProfress = 0;
+        /// <summary>
+        /// 缓存创建进度，1表示创建完成
+        /// </summary>
+        public float progress
+        {
+            get
+            {
+                if (mCreateAllFiles != null)
+                {
+                    return mProfress;
+                }
+                return 1f;
+            }
+            private set
+            {
+                mProfress = value;
+            }
+        }
+
+        /// <summary>
+        /// 协程数量
+        /// </summary>
+        public int coroutineCount
+        {
+            get
+            {
+                return 3;
+            }
+        }
+
         static XUFindReferencesCache()
         {
-            //if (mInstance != null)
-            //    return;
+            EditorApplication.update += Update;
+        }
 
-            mInstance = new XUFindReferencesCache();
-            if (File.Exists(mInstance.CACHE_PATH))
+        private static void Update()
+        {
+            if (!EditorApplication.isCompiling)
             {
-                mInstance.ReadCache();
-            }
-            else
-            {
-                mInstance.CreateCache();
+                EditorApplication.update -= Update;
+
+                mInstance = new XUFindReferencesCache();
+                if (File.Exists(mInstance.CACHE_PATH))
+                {
+                    mInstance.ReadCache();
+                }
+                else
+                {
+                    //mInstance.CreateCache();
+                }
             }
         }
 
@@ -72,58 +117,128 @@ namespace XUFindRef
                     }
                 }
             }
+
+            Debug.Log("XUFindReferences ------------> ReadCache");
         }
 
-        private void CreateCache()
+        private bool CreateCache()
         {
-            List<string> allFiles = new List<string>(Directory.GetFiles(Application.dataPath, "*.*", SearchOption.AllDirectories));
-            for (int i = 0; i < allFiles.Count; i++)
+            if (mCreateAllFiles != null)
             {
-                string file = allFiles[i];
-                string assetsPath = "Assets" + Path.GetFullPath(file).Replace(Path.GetFullPath(Application.dataPath), "").Replace('\\', '/');
-                string guid = AssetDatabase.AssetPathToGUID(assetsPath);
+                return false;
+            }
 
-                //正向存储
-                if (referencesForward.ContainsKey(guid) == false)
+            mCreateAllFiles = new List<string>(Directory.GetFiles(Application.dataPath, "*.*", SearchOption.AllDirectories));
+            mCreateIndexForward = 0;
+            mCreateCompleteForward = 0;
+            mCreateIndexReverse = 0;
+            mCreateCompleteReverse = 0;
+
+            for (int i = 0; i < coroutineCount; i++)
+            {
+                EditorCoroutineRunner.StartEditorCoroutine(CreateCacheRunnerForward());
+            }
+
+            return true;
+        }
+
+        private IEnumerator CreateCacheRunnerForward()
+        {
+            while (true)
+            {
+                progress = 0 + (mCreateIndexForward * 1.0f / mCreateAllFiles.Count * 1.0f / 2f);
+
+                if (mCreateIndexForward < mCreateAllFiles.Count)
                 {
-                    referencesForward.Add(guid, new List<string>());
-                    string[] dependencies = AssetDatabase.GetDependencies(assetsPath);
-                    if (dependencies != null && dependencies.Length > 0)
+                    string file = mCreateAllFiles[mCreateIndexForward++];
+                    string assetsPath = "Assets" + Path.GetFullPath(file).Replace(Path.GetFullPath(Application.dataPath), "").Replace('\\', '/');
+                    string guid = AssetDatabase.AssetPathToGUID(assetsPath);
+
+                    //正向存储
+                    if (referencesForward.ContainsKey(guid) == false)
                     {
-                        foreach (var dependencie in dependencies)
+                        referencesForward.Add(guid, new List<string>());
+                        string[] dependencies = AssetDatabase.GetDependencies(assetsPath);
+                        if (dependencies != null && dependencies.Length > 0)
                         {
-                            string dependencieGUID = AssetDatabase.AssetPathToGUID(dependencie);
-                            if (referencesForward[guid].Contains(dependencieGUID) == false && dependencieGUID != guid)
+                            foreach (var dependencie in dependencies)
                             {
-                                referencesForward[guid].Add(dependencieGUID);
+                                string dependencieGUID = AssetDatabase.AssetPathToGUID(dependencie);
+                                if (referencesForward[guid].Contains(dependencieGUID) == false && dependencieGUID != guid)
+                                {
+                                    referencesForward[guid].Add(dependencieGUID);
+                                }
                             }
                         }
                     }
-                }
 
-                //逆向存储
-                if (referencesReverse.ContainsKey(guid) == false)
+                    //逆向存储
+                    if (referencesReverse.ContainsKey(guid) == false)
+                    {
+                        referencesReverse.Add(guid, new List<string>());
+                    }
+
+                    yield return 0;
+                }
+                else
                 {
-                    referencesReverse.Add(guid, new List<string>());
+                    break;
                 }
             }
 
-            //解析逆向引用
-            foreach (var refForward in referencesForward)
+            mCreateCompleteForward++;
+            if (mCreateCompleteForward == coroutineCount)
             {
-                foreach (var dependencieGUID in refForward.Value)
+                List<string> forwardKeys = new List<string>();
+                foreach (var refForward in referencesForward)
                 {
-                    if (referencesReverse.ContainsKey(dependencieGUID))
+                    forwardKeys.Add(refForward.Key);
+                }
+                for (int i = 0; i < coroutineCount; i++)
+                {
+                    EditorCoroutineRunner.StartEditorCoroutine(CreateCacheRunnerReverse(forwardKeys));
+                }
+            }
+        }
+
+        private IEnumerator CreateCacheRunnerReverse(List<string> forwardKeys)
+        {
+            while (true)
+            {
+                progress = 0.5f + (mCreateIndexReverse * 1f / forwardKeys.Count * 1f / 2f);
+
+                if (mCreateIndexReverse < forwardKeys.Count)
+                {
+                    //解析逆向引用
+                    string refForwardKey = forwardKeys[mCreateIndexReverse++];
+                    var refForwardValue = referencesForward[refForwardKey];
+                    foreach (var dependencieGUID in refForwardValue)
                     {
-                        if (referencesReverse[dependencieGUID].Contains(refForward.Key) == false && refForward.Key != dependencieGUID)
+                        if (referencesReverse.ContainsKey(dependencieGUID))
                         {
-                            referencesReverse[dependencieGUID].Add(refForward.Key);
+                            if (referencesReverse[dependencieGUID].Contains(refForwardKey) == false && refForwardKey != dependencieGUID)
+                            {
+                                referencesReverse[dependencieGUID].Add(refForwardKey);
+                            }
                         }
                     }
+                    yield return 0;
+                }
+                else
+                {
+                    break;
                 }
             }
 
-            SaveCache();
+            mCreateCompleteReverse++;
+            if (mCreateCompleteReverse == coroutineCount)
+            {
+                if (mCreateAllFiles != null)
+                {
+                    SaveCache();
+                    mCreateAllFiles = null;
+                }
+            }
         }
 
         public void SaveCache()
@@ -133,6 +248,8 @@ namespace XUFindRef
             jsonObj.Add(CACHE_KEY_REVERSE, referencesReverse);
             string jsonStr = Json.Serialize(jsonObj);
             File.WriteAllText(CACHE_PATH, jsonStr);
+
+            Debug.Log("XUFindReferences ------------> SaveCache");
         }
 
         public void CacheOne(string assetsPath)
@@ -177,9 +294,9 @@ namespace XUFindRef
                     {
                         if (dependencieGUID == guid)
                         {
-                            if (referencesReverse[dependencieGUID].Contains(refForward.Key) == false && refForward.Key != dependencieGUID)
+                            if (referencesReverse[guid].Contains(refForward.Key) == false && refForward.Key != guid)
                             {
-                                referencesReverse[dependencieGUID].Add(refForward.Key);
+                                referencesReverse[guid].Add(refForward.Key);
                             }
                         }
                     }
@@ -210,16 +327,18 @@ namespace XUFindRef
             }
         }
 
-        ///////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
         /// <summary>
         /// 刷新缓存数据
         /// </summary>
         public void RefreshCache()
         {
-            referencesForward = new Dictionary<string, List<string>>();
-            referencesReverse = new Dictionary<string, List<string>>();
-            CreateCache();
+            if (CreateCache())
+            {
+                referencesForward = new Dictionary<string, List<string>>();
+                referencesReverse = new Dictionary<string, List<string>>();
+            }
         }
 
         /// <summary>
@@ -269,29 +388,34 @@ namespace XUFindRef
             string guid = AssetDatabase.AssetPathToGUID(path);
             return GetReferencesByGUID(guid);
         }
-    }
 
-    public class XUFindReferencesPostprocessor : AssetPostprocessor
-    {
+        ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
         static void OnPostprocessAllAssets(string[] importedAssets, string[] deletedAssets, string[] movedAssets, string[] movedFromAssetPaths)
         {
+            //缓存尚未创建或者正在创建中
+            if (mInstance == null || File.Exists(mInstance.CACHE_PATH) == false || mInstance.progress < 1f)
+            {
+                return;
+            }
+
             foreach (string str in importedAssets)
             {
-                XUFindReferencesCache.GetInstance().CacheOne(str);
+                mInstance.CacheOne(str);
             }
             foreach (string str in deletedAssets)
             {
-                XUFindReferencesCache.GetInstance().RemoveOne(str);
+                mInstance.RemoveOne(str);
             }
             foreach (string str in movedAssets)
             {
-                XUFindReferencesCache.GetInstance().CacheOne(str);
+                mInstance.CacheOne(str);
             }
             foreach (string str in movedFromAssetPaths)
             {
-                XUFindReferencesCache.GetInstance().CacheOne(str);
+                mInstance.CacheOne(str);
             }
-            XUFindReferencesCache.GetInstance().SaveCache();
+            mInstance.SaveCache();
         }
     }
 }
